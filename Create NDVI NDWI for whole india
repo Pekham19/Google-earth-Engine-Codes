@@ -1,0 +1,118 @@
+// ---------- USER PARAMETERS ----------
+var startDate = '2024-01-01';   // change as needed
+var endDate   = '2024-12-31';   // change as needed
+var outputScale = 30;           // meters. Set 10 for native S2 resolution (may be very large).
+var exportFolder = 'GEE_India_Indices'; // Drive folder (will be created if needed)
+var exportFileName = 'India_NDVI_NDWI_MNDWI_2024_median'; // file name prefix
+// -------------------------------------
+
+// 1) Get India geometry (LSIB)
+var india = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+            .filter(ee.Filter.eq('country_na', 'India'));
+var indiaGeom = india.geometry();
+
+// 2) Robust cloud mask that always returns ee.Image objects
+function maskS2Generic(image) {
+  var bands = image.bandNames();
+
+  // Build QA60 mask branch (returns an ee.Image)
+  var qa60Mask = ee.Image(ee.Algorithms.If(
+    bands.contains('QA60'),
+    // If QA60 exists -> use bitmask (bits 10 and 11 = clouds/cirrus)
+    image.select('QA60').bitwiseAnd(1 << 10).eq(0)
+      .and(image.select('QA60').bitwiseAnd(1 << 11).eq(0)),
+    // Else -> return all-ones image (keep pixels)
+    ee.Image(1)
+  ));
+
+  // Build MSK_CLDPRB mask branch (returns an ee.Image)
+  var mskClMask = ee.Image(ee.Algorithms.If(
+    bands.contains('MSK_CLDPRB'),
+    // Keep pixels where cloud probability < 50
+    image.select('MSK_CLDPRB').lt(50),
+    ee.Image(1)
+  ));
+
+  // Build SCL mask branch (returns an ee.Image)
+  var sclMask = ee.Image(ee.Algorithms.If(
+    bands.contains('SCL'),
+    // Exclude SCL classes representing shadow/clouds/cirrus/snow:
+    // 3 (Shadow), 8 (Cloud medium probability), 9 (Cloud high prob), 10 (Thin cirrus)
+    image.select('SCL').neq(3)
+          .and(image.select('SCL').neq(8))
+          .and(image.select('SCL').neq(9))
+          .and(image.select('SCL').neq(10)),
+    ee.Image(1)
+  ));
+
+  // Combine the masks. All are ee.Image, so .and() is safe.
+  var combinedMask = qa60Mask.and(mskClMask).and(sclMask);
+
+  return image.updateMask(combinedMask).copyProperties(image, ['system:time_start']);
+}
+
+// 3) Load Sentinel-2 SR, filter, mask clouds, select bands, scale to reflectance
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+           .filterBounds(indiaGeom)
+           .filterDate(startDate, endDate)
+           .map(maskS2Generic)
+           .select(['B2','B3','B4','B8','B11']); // B2=blue, B3=green, B4=red, B8=NIR, B11=SWIR
+
+print('S2_SR count (after mask & filter):', s2.size());
+
+// scale to 0..1 (S2_SR is scaled by 10000)
+function scaleToReflectance(img){
+  return img.divide(10000).copyProperties(img, ['system:time_start']);
+}
+var s2_scaled = s2.map(scaleToReflectance);
+
+// 4) Build a median composite and clip to India
+var composite = s2_scaled.median().clip(indiaGeom);
+
+// 5) Visual checks: true color using B4,B3,B2
+Map.centerObject(indiaGeom, 5);
+Map.addLayer(composite, {bands:['B4','B3','B2'], min:0, max:0.3}, 'S2 median (true color)');
+
+// 6) Compute indices (NDVI, NDWI (McFeeters), MNDWI)
+var ndvi = composite.expression(
+  '(NIR - RED) / (NIR + RED)',
+  { 'NIR': composite.select('B8'), 'RED': composite.select('B4') }
+).rename('NDVI');
+
+var ndwi = composite.expression(
+  '(GREEN - NIR) / (GREEN + NIR)',
+  { 'GREEN': composite.select('B3'), 'NIR': composite.select('B8') }
+).rename('NDWI');
+
+var mndwi = composite.expression(
+  '(GREEN - SWIR) / (GREEN + SWIR)',
+  { 'GREEN': composite.select('B3'), 'SWIR': composite.select('B11') }
+).rename('MNDWI');
+
+// 7) Visualize quick checks
+Map.addLayer(ndvi, {min:-0.5, max:0.8}, 'NDVI');
+Map.addLayer(ndwi, {min:-1, max:1}, 'NDWI');
+Map.addLayer(mndwi, {min:-1, max:1}, 'MNDWI');
+
+// 8) Stack bands into one image and export to Google Drive
+var out = ndvi.addBands([ndwi, mndwi]);
+
+out = out.set({
+  'system:time_start': ee.Date(startDate).millis(),
+  'start_date': startDate,
+  'end_date': endDate,
+  'source': 'COPERNICUS/S2_SR',
+  'notes': 'Median composite, cloud masked (generic), reflectance scaled to 0..1'
+});
+
+// Export: to Drive (GeoTIFF). For very large exports consider Export to Assets or GCS.
+Export.image.toDrive({
+  image: out.toFloat(),
+  description: exportFileName,
+  folder: exportFolder,
+  fileNamePrefix: exportFileName,
+  region: indiaGeom,
+  scale: outputScale,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
