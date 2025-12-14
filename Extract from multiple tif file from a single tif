@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""
+extract_bands_windows.py
+"""
+from pathlib import Path
+import rasterio
+import rasterio.errors
+import sys
+
+# === YOUR TIFF PATH (RAW STRING) ===
+INPUT_TIF = r"Your Tiff"
+# =====================================
+
+def safe_name(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in s).strip("_")
+
+def extract_bands(input_tif: str, compress: bool = True):
+    src_path = Path(input_tif)
+    if not src_path.exists():
+        print(f"ERROR: input file not found: {src_path}")
+        return
+
+    out_dir = src_path.with_name(src_path.stem + "_bands")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {out_dir}")
+
+    try:
+        with rasterio.open(src_path) as src:
+            profile = src.profile.copy()
+            count = src.count
+            descriptions = src.descriptions
+
+            for i in range(1, count + 1):
+                band_arr = src.read(i)
+                out_profile = profile.copy()
+                out_profile.update({
+                    "count": 1,
+                    "dtype": band_arr.dtype,
+                    "compress": "LZW" if compress else None
+                })
+
+                desc = None
+                if descriptions and descriptions[i-1]:
+                    desc = safe_name(descriptions[i-1])
+
+                out_name = f"{src_path.stem}_{desc}.tif" if desc else f"{src_path.stem}_band{i}.tif"
+                out_path = out_dir / out_name
+
+                with rasterio.open(out_path, "w", **out_profile) as dst:
+                    dst.write(band_arr, 1)
+                    if src.nodatavals and src.nodatavals[i-1] is not None:
+                        dst.nodatavals = (src.nodatavals[i-1],)
+
+                print(f"Wrote: {out_path}")
+
+    except Exception as e:
+        print("Error:", e)
+
+if __name__ == "__main__":
+    extract_bands(INPUT_TIF)
