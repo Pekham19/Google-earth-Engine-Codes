@@ -1,0 +1,163 @@
+// Fixed and robust: Seasonal yearly GRACE trend at points (Pre & Post monsoon)
+// Points
+var points = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point(Area lat long), {name: 'Location'}),
+  ee.Feature(ee.Geometry.Point(Area lat long), {name: 'Location'}),
+  ee.Feature(ee.Geometry.Point(Area lat long), {name: 'Location'}),
+  ee.Feature(ee.Geometry.Point(Area lat long), {name: 'Location'}),
+  ee.Feature(ee.Geometry.Point(Area lat long), {name: LOcation})
+]);
+
+Map.centerObject(points, 7);
+Map.addLayer(points, {color: 'red'}, 'Input Points');
+
+// Parameters
+var startDate = '2004-01-01';
+var endDate   = '2024-08-31';
+var epoch = ee.Date(startDate);
+
+// Load GRACE monthly mascon lwe_thickness
+var grace = ee.ImageCollection('NASA/GRACE/MASS_GRIDS_V04/MASCON_CRI')
+              .select('lwe_thickness')
+              .filterDate(startDate, endDate);
+
+print('Monthly GRACE count:', grace.size());
+
+// Helper: build yearly-seasonal collection for contiguous month-range [startMonth, endMonth]
+// This version uses a masked placeholder image for years without any monthly data,
+// then filters out years that have zero unmasked pixels (within a buffer around points).
+function seasonalYearlyContiguous(collection, startMonth, endMonth) {
+  // years sequence
+  var firstYear = ee.Number(ee.Date(collection.first().get('system:time_start')).get('year'));
+  var lastYear  = ee.Number(ee.Date(collection.sort('system:time_start', false).first().get('system:time_start')).get('year'));
+  var years = ee.List.sequence(firstYear, lastYear);
+
+  var coll = ee.ImageCollection(years.map(function(y){
+    y = ee.Number(y).toInt();
+
+    // filter collection for this year and months range
+    var season = collection
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .filter(ee.Filter.calendarRange(startMonth, endMonth, 'month'));
+
+    // If season has >=1 images, compute mean; otherwise create a fully-masked placeholder image.
+    var seasonSize = season.size();
+
+    var seasonImg = ee.Algorithms.If(
+      seasonSize.gt(0),
+      // true: mean image of the season months
+      season.mean().set('year', y).set('system:time_start', ee.Date.fromYMD(y, 6, 15).millis()),
+      // false: placeholder masked image with same band name so downstream code won't break
+      ee.Image.constant(0).rename('lwe_thickness')
+        .updateMask(ee.Image.constant(0)) // fully masked
+        .set('year', y)
+        .set('system:time_start', ee.Date.fromYMD(y, 6, 15).millis())
+    );
+
+    return ee.Image(seasonImg);
+  }));
+
+  // Now remove fully-masked images by checking for unmasked pixels inside a buffer around points.
+  // This counts unmasked lwe_thickness pixels in a large area; if count==0 => drop the image.
+  var sampleRegion = points.geometry().buffer(200000); // 200 km buffer to capture any mascon pixel
+  var withCount = coll.map(function(img){
+    var count = img.select('lwe_thickness').reduceRegion({
+      reducer: ee.Reducer.count(),
+      geometry: sampleRegion,
+      scale: 250000
+    }).get('lwe_thickness');
+    return img.set('pixel_count', ee.Number(count));
+  });
+
+  var filtered = withCount.filter(ee.Filter.gt('pixel_count', 0));
+
+  return filtered;
+}
+
+// Seasons (contiguous)
+var preStart = 4, preEnd = 7;      // Apr - Jul (pre-monsoon)
+var postStart = 9, postEnd = 12;  // Oct - Dec (post-monsoon)
+
+var preYearly  = seasonalYearlyContiguous(grace, preStart, preEnd);
+var postYearly = seasonalYearlyContiguous(grace, postStart, postEnd);
+
+print('Pre-yearly size (valid years):', preYearly.size());
+print('Post-yearly size (valid years):', postYearly.size());
+print('Pre-yearly sample:', preYearly.limit(10));
+print('Post-yearly sample:', postYearly.limit(10));
+
+// If either collection has fewer than 2 years, print a clear warning.
+preYearly.size().evaluate(function(n){
+  if (n < 2) {
+    print('WARNING: Pre-monsoon yearly collection has fewer than 2 valid years. Trend cannot be computed.');
+  }
+});
+postYearly.size().evaluate(function(n){
+  if (n < 2) {
+    print('WARNING: Post-monsoon yearly collection has fewer than 2 valid years. Trend cannot be computed.');
+  }
+});
+
+// Add time band 't' (years since epoch)
+function addTimeBand(img){
+  var t = ee.Image(ee.Number(img.date().difference(epoch, 'year'))).rename('t').toFloat();
+  return img.addBands(t);
+}
+var preWithT = preYearly.map(addTimeBand);
+var postWithT = postYearly.map(addTimeBand);
+
+// Compute and display trends only when there are >= 2 valid yearly-seasonal images
+preYearly.size().gte(2).evaluate(function(ok){
+  if (ok) {
+    var preFit = preWithT.select(['t','lwe_thickness']).reduce(ee.Reducer.linearFit());
+    var slopePre = preFit.select('scale');
+    Map.addLayer(slopePre.clip(points.geometry().buffer(50000)), {min:-2, max:2, palette:['#a50026','#f46d43','#ffffbf','#74add1','#313695']}, 'Pre-monsoon slope (cm/yr)');
+    var slopePreAtPoints = slopePre.reduceRegions({
+      collection: points,
+      reducer: ee.Reducer.mean(),
+      scale: 250000
+    });
+    print('Pre-monsoon slope at points:', slopePreAtPoints);
+  } else {
+    print('Skipping Pre-monsoon trend: not enough valid yearly-seasonal images.');
+  }
+});
+
+postYearly.size().gte(2).evaluate(function(ok){
+  if (ok) {
+    var postFit = postWithT.select(['t','lwe_thickness']).reduce(ee.Reducer.linearFit());
+    var slopePost = postFit.select('scale');
+    Map.addLayer(slopePost.clip(points.geometry().buffer(50000)), {min:-2, max:2, palette:['#a50026','#f46d43','#ffffbf','#74add1','#313695']}, 'Post-monsoon slope (cm/yr)');
+    var slopePostAtPoints = slopePost.reduceRegions({
+      collection: points,
+      reducer: ee.Reducer.mean(),
+      scale: 250000
+    });
+    print('Post-monsoon slope at points:', slopePostAtPoints);
+  } else {
+    print('Skipping Post-monsoon trend: not enough valid yearly-seasonal images.');
+  }
+});
+
+// Charts (will be empty if the collections are empty)
+var chartPre = ui.Chart.image.seriesByRegion({
+  imageCollection: preYearly,
+  regions: points,
+  reducer: ee.Reducer.mean(),
+  scale: 250000,
+  seriesProperty: 'name',
+  xProperty: 'year'
+}).setChartType('LineChart')
+  .setOptions({title: 'Pre-monsoon (Apr-Jul) — Yearly GRACE lwe_thickness at points', hAxis:{title:'Year'}, vAxis:{title:'lwe_thickness (cm)'}});
+print(chartPre);
+
+var chartPost = ui.Chart.image.seriesByRegion({
+  imageCollection: postYearly,
+  regions: points,
+  reducer: ee.Reducer.mean(),
+  scale: 250000,
+  seriesProperty: 'name',
+  xProperty: 'year'
+}).setChartType('LineChart')
+  .setOptions({title: 'Post-monsoon (Sep-Dec) — Yearly GRACE lwe_thickness at points', hAxis:{title:'Year'}, vAxis:{title:'lwe_thickness (cm)'}});
+print(chartPost);
