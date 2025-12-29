@@ -1,0 +1,157 @@
+/*******************************************************
+ Daily WBGT time series + trend chart at a point
+ Location: lon=87.9707, lat=22.4683 (no buffer)
+ Fix: ensure images have 'system:time_start' so charts work
+*******************************************************/
+
+// Point (no buffer)
+var region = ee.Geometry.Point(87.9707, 22.4683);
+Map.centerObject(region, 10);
+Map.addLayer(region, {color: 'red'}, 'Target Point');
+
+// Date range (full year 2024)
+var startDate = '2024-01-01';
+var endDate   = '2025-01-01'; // exclusive end
+var c_tg = 0.004; // globe temperature sensitivity
+
+// ERA5-Land hourly collection
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY');
+
+// Helper: list of date strings
+function makeDateList(start, end) {
+  var s = ee.Date(start);
+  var e = ee.Date(end);
+  var nDays = e.difference(s, 'day').toInt();
+  return ee.List.sequence(0, nDays.subtract(1)).map(function(i) {
+    return s.advance(ee.Number(i), 'day').format('YYYY-MM-dd');
+  });
+}
+
+// Compute daily WBGT for a date string
+function dailyWBGT(dateStr) {
+  var date = ee.Date(dateStr);
+  var next = date.advance(1, 'day');
+
+  var dayColl = era5.filterDate(date, next);
+
+  var dailyMean = dayColl.select([
+    'temperature_2m',
+    'dewpoint_temperature_2m',
+    'surface_solar_radiation_downwards',
+    'u_component_of_wind_10m',
+    'v_component_of_wind_10m'
+  ]).mean();
+
+  var T_C = dailyMean.select('temperature_2m').subtract(273.15).rename('T_C');
+  var Td_C = dailyMean.select('dewpoint_temperature_2m').subtract(273.15).rename('Td_C');
+
+  var SR_Wm2 = dailyMean.select('surface_solar_radiation_downwards').divide(3600).rename('SR_Wm2');
+
+  var u = dailyMean.select('u_component_of_wind_10m');
+  var v = dailyMean.select('v_component_of_wind_10m');
+  var wind = u.pow(2).add(v.pow(2)).sqrt().rename('wind_ms');
+
+  // Relative Humidity (Magnus approximation)
+  var alpha_td = Td_C.multiply(17.625).divide(Td_C.add(243.04));
+  var alpha_t  = T_C.multiply(17.625).divide(T_C.add(243.04));
+  var es_td = alpha_td.exp();
+  var es_t  = alpha_t.exp();
+  var RH = es_td.divide(es_t).multiply(100).rename('RH_percent');
+  RH = RH.where(RH.gt(100), 100).where(RH.lt(0.1), 0.1);
+
+  // Wet-bulb (Stull 2011)
+  var sqrtTerm = RH.add(8.313659).sqrt().multiply(0.151977).atan().multiply(T_C);
+  var term2 = T_C.add(RH).atan();
+  var term3 = RH.subtract(1.676331).atan();
+  var term4 = RH.pow(1.5).multiply(0.00391838).multiply(RH.multiply(0.023101).atan());
+  var Tw = sqrtTerm.add(term2).subtract(term3).add(term4).subtract(4.686035).rename('Tw_C');
+
+  // Globe temperature (empirical)
+  var Tg = T_C.add( SR_Wm2.multiply(c_tg).divide(wind.add(0.1)) ).rename('Tg_C');
+
+  // WBGT (outdoor in sun)
+  var WBGT = Tw.multiply(0.7).add(Tg.multiply(0.2)).add(T_C.multiply(0.1)).rename('WBGT_C');
+
+  // Compose output image and explicitly set system:time_start and date
+  var out = ee.Image.cat([WBGT, Tw, Tg, T_C, RH, SR_Wm2, wind])
+    .set({
+      // ensure the standard time property exists and is numeric (ms since epoch)
+      'system:time_start': date.millis(),
+      // also keep a human-readable date string
+      'date': date.format('YYYY-MM-dd')
+    });
+
+  // Return the image (no copyProperties that can overwrite system:time_start)
+  return out;
+}
+
+// Build daily collection
+var dates = makeDateList(startDate, endDate);
+var dailyList = dates.map(function(d){ return dailyWBGT(ee.String(d)); });
+var dailyCollection = ee.ImageCollection(dailyList);
+
+// Quick inspect
+print('Daily WBGT collection (first 6 days)', dailyCollection.limit(6));
+Map.addLayer(dailyCollection.first().select('WBGT_C'), {min:15, max:35}, 'WBGT sample');
+
+// ---------------------- Trend chart ----------------------
+// Create a chart of daily WBGT at the point
+var chart = ui.Chart.image.series({
+  imageCollection: dailyCollection.select('WBGT_C'),
+  region: region,
+  reducer: ee.Reducer.mean(),
+  scale: 1000,
+  // specify seriesProperty to use 'date' if needed, but system:time_start is present now
+})
+.setOptions({
+  title: 'Daily mean WBGT at point (87.9707, 22.4683) — 2024',
+  hAxis: {title: 'Date', format: 'yyyy-MM-dd'},
+  vAxis: {title: 'WBGT (°C)'},
+  pointSize: 4,
+  series: { 0: { color: 'navy' } },
+  trendlines: { 0: { type: 'linear', visibleInLegend: true, color: 'red', lineWidth: 2 } },
+  explorer: { actions: ['dragToZoom', 'rightClickToReset'], axis: 'horizontal' }
+});
+
+print(chart);
+
+// ---------------------- Numeric linear fit (slope in °C/year) ----------------------
+// Prepare collection of images with two bands: 't' = time (ms) and 'WBGT_C'
+var withTime = dailyCollection.map(function(img) {
+  // use system:time_start which we set earlier
+  var t = ee.Number(img.get('system:time_start')).toDouble();
+  var tImg = ee.Image.constant(t).rename('t').toDouble();
+  return img.select('WBGT_C').addBands(tImg).set('system:time_start', img.get('system:time_start'));
+});
+
+// Apply linearFit reducer across the collection
+var fitImage = withTime.select(['t','WBGT_C']).reduce(ee.Reducer.linearFit());
+
+// slope in °C per millisecond
+var slopeMs = fitImage.select('scale');
+
+// Convert slope to °C per year
+var msPerYear = ee.Number(1000 * 60 * 60 * 24 * 365);
+var slopePerYearImage = slopeMs.multiply(msPerYear).rename('slope_per_year_C');
+
+// Sample slope at the point
+var slopeDict = slopePerYearImage.reduceRegion({
+  reducer: ee.Reducer.first(),
+  geometry: region,
+  scale: 1000,
+  maxPixels: 1e13
+});
+var slopePerYear = slopeDict.get('slope_per_year_C');
+print('Linear trend (WBGT °C per year) at point:', slopePerYear);
+
+// Also print the intercept (offset) at epoch (optional)
+var intercept = fitImage.select('offset').reduceRegion({
+  reducer: ee.Reducer.first(),
+  geometry: region,
+  scale: 1000,
+  maxPixels: 1e13
+}).get('offset');
+print('Intercept (°C) at epoch (WBGT offset):', intercept);
+
+// Optional: show slope image on the map
+Map.addLayer(slopePerYearImage, {min: -0.5, max: 0.5}, 'Slope (°C / year)');
