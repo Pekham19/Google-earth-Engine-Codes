@@ -1,0 +1,138 @@
+// =======================================================
+// GROUNDWATER TREND (ΔGW) – WEST BENGAL
+// FINAL STABLE VERSION (TYPE-SAFE)
+// 2020–2022
+// =======================================================
+
+// ----------------------------
+// 1. WEST BENGAL BOUNDARY
+// ----------------------------
+var wb = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM1_NAME', 'West Bengal'));
+
+Map.centerObject(wb, 7);
+Map.addLayer(wb, {color: 'black'}, 'West Bengal');
+
+// ----------------------------
+// 2. TIME SETTINGS
+// ----------------------------
+var start = ee.Date('2020-01-01');
+var end   = ee.Date('2020-12-31');
+
+var baseStart = ee.Date('2020-01-01');
+var baseEnd   = ee.Date('2020-12-31');
+
+// ----------------------------
+// 3. GRACE MASCON CRI V04 (cm)
+// ----------------------------
+var grace = ee.ImageCollection('NASA/GRACE/MASS_GRIDS_V04/MASCON_CRI')
+  .select('lwe_thickness')
+  .filterDate(start, end)
+  .map(function(img){
+    return img.clip(wb)
+      .rename('TWS')
+      .copyProperties(img, ['system:time_start']);
+  });
+
+var graceBase = grace.filterDate(baseStart, baseEnd).mean();
+
+var twsAnom = grace.map(function(img){
+  return img.subtract(graceBase)
+    .rename('TWS')
+    .copyProperties(img, ['system:time_start']);
+});
+
+// ----------------------------
+// 4. GLDAS CLSM v2.2 DAILY
+// ----------------------------
+var gldasDaily = ee.ImageCollection('NASA/GLDAS/V022/CLSM/G025/DA1D')
+  .filterDate(start, end);
+
+// ----------------------------
+// 5. COMPUTE ΔGW MONTHLY (ROBUST)
+// ----------------------------
+var gw_cm = twsAnom.map(function(graceImg){
+
+  var date = ee.Date(graceImg.get('system:time_start'));
+  var monthStart = date.advance(0, 'month');
+  var monthEnd   = monthStart.advance(1, 'month');
+
+  var gldasMonth = gldasDaily
+    .filterDate(monthStart, monthEnd)
+    .mean();
+
+  var sm = gldasMonth.select('SoilMoist_S_tavg')
+    .add(gldasMonth.select('SoilMoist_RZ_tavg'));
+
+  var swe = gldasMonth.select('SWE_tavg');
+  var cw  = gldasMonth.select('CanopInt_tavg');
+
+  var other_cm = sm.add(swe).add(cw)
+    .divide(10) // mm → cm
+    .rename('OTHER');
+
+  return graceImg.subtract(other_cm)
+    .rename('GW_cm')
+    .copyProperties(graceImg, ['system:time_start']);
+});
+
+// ----------------------------
+// 6. cm → meters
+// ----------------------------
+var gw_m = gw_cm.map(function(img){
+  return img.divide(100)
+    .rename('GW_m')
+    .copyProperties(img, ['system:time_start']);
+});
+
+// ----------------------------
+// 7. ADD TIME BAND (EXPLICIT CAST)
+// ----------------------------
+var withTime = gw_m.map(function(img){
+
+  var t = ee.Image
+    .constant(
+      ee.Date(img.get('system:time_start'))
+        .difference(start, 'year')
+    )
+    .toFloat()
+    .rename('time');
+
+  return img.addBands(t);
+});
+
+// ----------------------------
+// 8. TREND (m/year)
+// ----------------------------
+var trend = withTime
+  .select(['time', 'GW_m'])
+  .reduce(ee.Reducer.linearFit());
+
+var slope = trend.select('scale');
+
+// ----------------------------
+// 9. MAP TREND
+// ----------------------------
+Map.addLayer(slope, {
+  min: -0.03,
+  max: 0.03,
+  palette: ['red', 'white', 'blue']
+}, 'Groundwater Trend (m/year)');
+
+// ----------------------------
+// 10. TIME SERIES + TRENDLINE
+// ----------------------------
+var chart = ui.Chart.image.series({
+  imageCollection: gw_m,
+  region: wb,
+  reducer: ee.Reducer.mean(),
+  scale: 25000
+}).setOptions({
+  title: 'Groundwater Storage Anomaly (m) – West Bengal (2020–2022)',
+  hAxis: {title: 'Year'},
+  vAxis: {title: 'Groundwater (m)'},
+  lineWidth: 2,
+  trendlines: {0: {color: 'black', lineWidth: 3}}
+});
+
+print(chart);
